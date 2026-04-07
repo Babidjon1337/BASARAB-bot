@@ -1,0 +1,7 @@
+.env
+venv/
+__pycache__/
+products_test.json
+dummy_catalog.json
+google_key.json
+test.py
