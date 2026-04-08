@@ -13,5 +13,5 @@ MANAGER_USER_NAME = os.getenv("MANAGER_USER_NAME")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# URL для получения каталога из 1С (можешь заменить на боевой, когда 1С будет готова)
+# URL для получения каталога из 1С
 URL_1C = os.getenv("URL_1C")

@@ -41,6 +41,14 @@ class Store(Base):
     file_id = mapped_column(String, nullable=True)
 
 
+class Category(Base):
+
+    __tablename__ = "categories"
+
+    code = mapped_column(String(100), primary_key=True)
+    name = mapped_column(String, nullable=False)
+
+
 class Cart(Base):
     __tablename__ = "cart"
 
