@@ -145,6 +145,16 @@ async def update_product_photos(product_id: str, new_photos_str: str):
         await session.commit()
 
 
+# 🔥 ДОБАВЛЕНО: Функция для сохранения file_id
+async def update_product_file_id(product_id: str, file_ids_str: str):
+    """Сохраняет file_id фотографий товара в БД"""
+    async with async_session() as session:
+        await session.execute(
+            update(Store).where(Store.id == product_id).values(file_id=file_ids_str)
+        )
+        await session.commit()
+
+
 # --- КОРЗИНА ---
 
 

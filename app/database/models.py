@@ -38,6 +38,7 @@ class Store(Base):
     sizes = mapped_column(String)
     price = mapped_column(Integer, nullable=False)
     photo = mapped_column(String)
+    file_id = mapped_column(String, nullable=True)
 
 
 class Cart(Base):
