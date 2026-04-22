@@ -1,5 +1,6 @@
 import logging
 import uvicorn
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Header, HTTPException
@@ -8,8 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.client.bot import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 
-from config import BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET
+from config import (
+    BOT_TOKEN,
+    WEBHOOK_URL,
+    WEBHOOK_SECRET,
+    PROXY_URL,
+)
 
 # 1. Импортируем роутер aiogram для бота
 from app.database.models import async_main
@@ -19,13 +26,20 @@ from app.handlers.user import user_router
 # 2. ИМПОРТИРУЕМ НОВЫЙ РОУТЕР FASTAPI
 from app.api import api_router, fetch_and_sync_catalog
 
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+bot = Bot(
+    token=BOT_TOKEN,
+    session=AiohttpSession(proxy=PROXY_URL),
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
+
 
 # Подключаем роутер aiogram
 admin_router._parent_router = None
@@ -36,20 +50,45 @@ dp.include_routers(admin_router, user_router)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    polling_task = None
+
     logger.info("Bot start... Устанавливаем вебхук.")
     await async_main()  # Инициализация базы данных при запуске бота
-    await bot.set_webhook(
-        url=f"{WEBHOOK_URL}/webhook",
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,
-    )
+
+    # --- ВАРИАНТ 1: WEBHOOK (Закомментирован) ---
+    # Раскомментируйте эти строки, чтобы вернуть вебхуки:
+    # await bot.set_webhook(
+    #     url=f"{WEBHOOK_URL}/webhook",
+    #     secret_token=WEBHOOK_SECRET,
+    #     drop_pending_updates=True,
+    # )
+    # logger.info(f"Вебхук установлен: {webhook_url}")
+    # -----------------------------------------------------------------
+
+    # --- ВАРИАНТ 2: LONG POLLING (Активен сейчас) ---
+    # Закомментируйте эти строки, если переходите обратно на вебхуки:
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Вебхук Telegram удален. Переходим на Long Polling.")
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    # -----------------------------------------------------------------
 
     # ВОТ ЗДЕСЬ БОТ ЗАПРАШИВАЕТ КАТАЛОГ ИЗ 1С ПРИ ЗАПУСКЕ
     await fetch_and_sync_catalog()
 
     yield
-    logger.info("Bot stop... Удаляем вебхук.")
-    await bot.delete_webhook()
+    # --- ВАРИАНТ 1: WEBHOOK (Закомментирован) ---
+    # Раскомментировать, если возвращаетесь на вебхуки:
+    # await bot.delete_webhook()
+    # -----------------------------------------------------------------
+
+    # --- ВАРИАНТ 2: LONG POLLING (Активен сейчас) ---
+    # Закомментировать, если возвращаетесь на вебхуки:
+    if polling_task:
+        polling_task.cancel()
+    # -----------------------------------------------------------------
+
+    await bot.session.close()
+    logger.info("Сессия бота закрыта")
 
 
 app = FastAPI(lifespan=lifespan)

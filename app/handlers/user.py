@@ -1,4 +1,5 @@
 import asyncio
+import time
 import random
 import re
 import urllib.parse
@@ -16,14 +17,13 @@ from aiogram.types import (
     BufferedInputFile,
     ReplyKeyboardRemove,
 )
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from loguru import logger
 from sqlalchemy import update
 
 import app.keyboards as kb
 import app.database.requests as rq
 from app.database.models import User, Order, Store
-
 from app.api import (
     send_user_to_1c,
     check_stock_in_1c,
@@ -63,33 +63,67 @@ class CheckoutState(StatesGroup):
 
 
 async def get_product_media_from_urls_fallback(urls: list) -> list:
-    """Скачивает картинки вручную, жестко проверяя их валидность (защита от IMAGE_PROCESS_FAILED)."""
+    """Скачивает картинки вручную, обходя защиту WAF (DDoS-Guard/Cloudflare)."""
     results = []
-    async with aiohttp.ClientSession() as session:
+    download_attempted = 0
+    success_count = 0
+    failed_details = []
+
+    # 🔥 ЖЕСТКАЯ МАКИРОВКА ПОД БРАУЗЕР CHROME (Защита от WAF / DDoS-Guard)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://basarab.ru/",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    # Отключаем строгий SSL
+    connector = aiohttp.TCPConnector(ssl=False)
+    start = time.time()
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         for url in urls:
-            if isinstance(url, str) and (url.startswith("AgA") or url == DEFAULT_PHOTO):
+            if isinstance(url, str) and (
+                url.startswith("AgA") or url in (DEFAULT_PHOTO, MAIN_PHOTO)
+            ):
                 results.append(url)
                 continue
 
-            orig_url = url
+            download_attempted += 1
+
+            # Достаем оригинальную ссылку (.jpg)
             if isinstance(url, str) and "image_proxy.php?url=" in url:
-                orig_url = urllib.parse.unquote(url.split("image_proxy.php?url=")[1])
+                inner_url = url.split("image_proxy.php?url=")[1]
+                orig_url = urllib.parse.unquote(inner_url)
+            else:
+                orig_url = (
+                    urllib.parse.unquote(url) if isinstance(url, str) else str(url)
+                )
 
-            proxy_url = f"https://basarab.ru/15/image_proxy.php?url={orig_url}"
+            proxy_url = f"https://basarab.ru/15/image_proxy.php?url={urllib.parse.quote(orig_url, safe=':/_.-?=&')}"
+
             media_added = False
+            last_error = "Unknown"
 
-            for download_url in [proxy_url, orig_url]:
+            # 🔥 ВАЖНО: Сначала дергаем оригинальную ссылку (.jpg).
+            # Защита от DDoS (типа DDoS-Guard) почти всегда блокирует запросы к .php,
+            # но пропускает запросы к статике (.jpg, .png) без проверки JS.
+            download_urls = [orig_url, proxy_url]
+
+            for download_url in download_urls:
                 try:
-                    async with session.get(download_url, timeout=5) as resp:
+                    async with session.get(download_url, timeout=15) as resp:
                         if resp.status == 200:
                             data = await resp.read()
-                            # 🔥 Защита от битых файлов: проверяем сигнатуры реальных картинок
+                            # Защита от битых файлов: проверяем сигнатуры реальных картинок
                             if len(data) > 1024 and (
                                 data.startswith(b"\xff\xd8")
                                 or data.startswith(b"\x89PNG")
                                 or (data.startswith(b"RIFF") and b"WEBP" in data[8:12])
                             ):
-                                # 🔥 ДОБАВЛЕН RANDOM В ИМЯ: чтобы телеграм не путался при отправке альбомов
                                 results.append(
                                     BufferedInputFile(
                                         data,
@@ -97,14 +131,33 @@ async def get_product_media_from_urls_fallback(urls: list) -> list:
                                     )
                                 )
                                 media_added = True
+                                success_count += 1
                                 break
-                except Exception:
-                    pass
+                            else:
+                                last_error = f"Битый файл/HTML ({len(data)} байт)"
+                        else:
+                            last_error = f"HTTP {resp.status}"
+                except asyncio.TimeoutError:
+                    last_error = "Таймаут (Дольше 15 сек)"
+                except Exception as e:
+                    last_error = f"Ошибка сети: {type(e).__name__}"
 
             if not media_added:
-                results.append(
-                    DEFAULT_PHOTO
-                )  # Если файл битый или не скачался, ставим заглушку
+                # В лог пишем оригинальную ссылку, чтобы было удобно читать
+                failed_details.append(f"{orig_url} [{last_error}]")
+                results.append(DEFAULT_PHOTO)
+
+    # Компактное логирование
+    if download_attempted > 0:
+        if success_count == download_attempted:
+            logger.info(
+                f"⏬ Ручное скачивание: Успешно скачано {success_count} из {download_attempted} фото. Время: {time.time() - start:.2f} сек."
+            )
+        else:
+            fail_msg = "\n".join(failed_details)
+            logger.warning(
+                f"⏬ Ручное скачивание: Успешно {success_count} из {download_attempted}. Время: {time.time() - start:.2f} сек.\n\nОшибки: {fail_msg}"
+            )
 
     return results
 
@@ -456,7 +509,6 @@ async def send_product_page(
 
         return f"<b>{product.name}</b>{desc}{size_block}"
 
-    # 🔥 1. ВСЕГДА СОБИРАЕМ ОРИГИНАЛЬНЫЕ URL
     raw_photos = [
         p.strip().replace("\\", "/") for p in product.photo.split("|") if p.strip()
     ]
@@ -477,7 +529,6 @@ async def send_product_page(
         else:
             url_sources.append(f"https://basarab.ru/15/image_proxy.php?url={p}")
 
-    # 🔥 2. ПРОВЕРЯЕМ БАЗУ ДАННЫХ И ИГНОРИРУЕМ "ОТРАВЛЕННЫЕ" ЗАГЛУШКАМИ ФАЙЛЫ
     cached_fids = []
     if hasattr(product, "file_id") and product.file_id:
         cached_fids = [
@@ -486,10 +537,8 @@ async def send_product_page(
             if f.strip() and f.strip() not in (MAIN_PHOTO, DEFAULT_PHOTO)
         ]
 
-    # Формируем источники для быстрого пути (FIDs, если есть)
     fast_sources = cached_fids if cached_fids else url_sources
 
-    # Убираем дубликаты
     unique_fast_sources = []
     seen_ms = set()
     for m in fast_sources:
@@ -498,56 +547,68 @@ async def send_product_page(
             unique_fast_sources.append(m)
     fast_sources = unique_fast_sources
 
-    is_album = len(fast_sources) > 1
-    sent_messages = []
     old_media_ids = data.get("product_media_ids", [])
     was_album = len(old_media_ids) > 0
     can_cache = not bool(cached_fids)
 
-    async def _send_single(sources, is_edit_allowed):
-        media_item = sources[0]
-        cap = get_caption(is_photo=True)
-        if is_edit_allowed:
-            try:
-                msg = await callback.message.edit_media(
-                    media=InputMediaPhoto(media=media_item, caption=cap),
-                    reply_markup=keyboard,
-                )
-                return [msg]
-            except TelegramBadRequest as e:
-                err = str(e).lower()
-                if "message is not modified" in err:
-                    return []
-                if "message to edit not found" in err:
-                    pass
-        # Fallback to Send New
-        msg = await callback.message.answer_photo(
-            photo=media_item, caption=cap, reply_markup=keyboard
-        )
-        return [msg]
-
-    try:
-        # 🚀 БЫСТРЫЙ ПУТЬ: Пробуем отправить (file_id или URL)
-        if is_album:
-            album_inputs = [InputMediaPhoto(media=m) for m in fast_sources]
-            sent_messages = await callback.message.answer_media_group(
-                media=album_inputs
-            )
-            await callback.message.answer(
+    async def _send_media_group_or_single(sources, is_edit_allowed):
+        is_album_local = len(sources) > 1
+        if is_album_local:
+            inputs = [InputMediaPhoto(media=m) for m in sources]
+            msgs = list(await callback.message.answer_media_group(media=inputs))
+            text_msg = await callback.message.answer(
                 text=get_caption(is_photo=False), reply_markup=keyboard
             )
+            msgs.append(text_msg)
+            return msgs, False
         else:
-            sent_messages = await _send_single(
+            media_item = sources[0]
+            cap = get_caption(is_photo=True)
+            if is_edit_allowed:
+                try:
+                    msg = await callback.message.edit_media(
+                        media=InputMediaPhoto(media=media_item, caption=cap),
+                        reply_markup=keyboard,
+                    )
+                    return [msg], True
+                except TelegramBadRequest as e:
+                    err = str(e).lower()
+                    if "message is not modified" in err:
+                        return [], True
+                    if "message to edit not found" in err or "there is no media" in err:
+                        pass
+            msg = await callback.message.answer_photo(
+                photo=media_item, caption=cap, reply_markup=keyboard
+            )
+            return [msg], False
+
+    sent_messages = []
+    edited = False
+
+    try:
+        # 🔥 Обрабатываем TelegramRetryAfter (Flood Control)
+        try:
+            sent_messages, edited = await _send_media_group_or_single(
                 fast_sources, is_edit_allowed=not was_album
+            )
+        except TelegramRetryAfter as e:
+            return await callback.answer(
+                f"⏳ Слишком частое переключение! Подождите {e.retry_after} сек.",
+                show_alert=True,
             )
 
     except TelegramBadRequest as e:
-        logger.warning(
-            f"Быстрая отправка не удалась (возможно битый file_id), качаем вручную: {e}"
+        err_msg = (
+            str(e).split('error message "')[-1].replace('"', "")
+            if 'error message "' in str(e)
+            else str(e)
         )
-        # 🐌 МЕДЛЕННЫЙ ПУТЬ: Ручное скачивание с заглушками (Используем оригинальные URL!)
+        logger.warning(
+            f"Быстрая отправка ТГ не удалась ({err_msg}). Пробуем вручную..."
+        )
+
         manual_media = await get_product_media_from_urls_fallback(url_sources)
-        can_cache = True  # Если скачаем успешно, вылечим базу!
+        can_cache = True
 
         unique_manual = []
         seen_mm = set()
@@ -558,35 +619,32 @@ async def send_product_page(
                 seen_mm.add(m)
             unique_manual.append(m)
         manual_media = unique_manual
-        is_album_manual = len(manual_media) > 1
 
         if any(m == DEFAULT_PHOTO for m in manual_media):
             can_cache = False
 
         try:
-            if is_album_manual:
-                album_inputs = [InputMediaPhoto(media=m) for m in manual_media]
-                sent_messages = await callback.message.answer_media_group(
-                    media=album_inputs
-                )
-                await callback.message.answer(
-                    text=get_caption(is_photo=False), reply_markup=keyboard
-                )
-            else:
-                sent_messages = await _send_single(
+            try:
+                sent_messages, edited = await _send_media_group_or_single(
                     manual_media, is_edit_allowed=not was_album
                 )
+            except TelegramRetryAfter as e:
+                return await callback.answer(
+                    f"⏳ Слишком частое переключение! Подождите {e.retry_after} сек.",
+                    show_alert=True,
+                )
         except Exception as e2:
-            logger.error(
-                f"Ручное скачивание альбома провалилось. Ставим заглушку! {e2}"
-            )
-            is_album_manual = False
             can_cache = False
-            sent_messages = await _send_single(
-                [DEFAULT_PHOTO], is_edit_allowed=not was_album
-            )
+            try:
+                sent_messages, edited = await _send_media_group_or_single(
+                    [DEFAULT_PHOTO], is_edit_allowed=not was_album
+                )
+            except TelegramRetryAfter as e:
+                return await callback.answer(
+                    f"⏳ Слишком частое переключение! Подождите {e.retry_after} сек.",
+                    show_alert=True,
+                )
 
-    # Очищаем старые сообщения
     if was_album and old_media_ids:
         try:
             await bot.delete_messages(
@@ -594,17 +652,20 @@ async def send_product_page(
             )
         except Exception:
             pass
-    if is_album or was_album:
+
+    if not edited:
         try:
             await callback.message.delete()
         except Exception:
             pass
 
-    if is_album or (not is_album and len(fast_sources) > 1):
-        await state.update_data(product_media_ids=[m.message_id for m in sent_messages])
+    new_ids = [m.message_id for m in sent_messages if m]
+    if new_ids:
+        await state.update_data(product_media_ids=new_ids)
+    elif edited:
+        await state.update_data(product_media_ids=[callback.message.message_id])
     else:
-        if was_album:
-            await state.update_data(product_media_ids=[])
+        await state.update_data(product_media_ids=[])
 
     if can_cache and sent_messages:
         await cache_file_ids_in_db(product.id, sent_messages)
@@ -1001,11 +1062,23 @@ async def add_item_with_size_to_cart(
 
 
 async def edit_cart_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    """Обновляет только текст, если пользователь меняет количество (увеличивает/уменьшает без удаления)"""
+    """Обновляет только текст, возвращая интерфейс корзины, не перерисовывая картинки."""
     cart_items = await rq.get_cart(callback.from_user.id)
     if not cart_items:
-        # Если корзина пуста, отправляем на полную перерисовку
-        await view_cart(callback, state, bot)
+        text = (
+            "🛒 <b>Ваша корзина пуста</b>\n\nСамое время выбрать что-нибудь стильное!"
+        )
+        try:
+            if callback.message.text:
+                await callback.message.edit_text(
+                    text=text, reply_markup=kb.cart_keyboard([])
+                )
+            else:
+                await callback.message.edit_caption(
+                    caption=text, reply_markup=kb.cart_keyboard([])
+                )
+        except TelegramBadRequest:
+            pass
         return
 
     total_price = sum(store_obj.price * qty for _, store_obj, _, qty in cart_items)
@@ -1036,10 +1109,18 @@ async def edit_cart_callback(callback: CallbackQuery, state: FSMContext, bot: Bo
 
 @user_router.callback_query(F.data == "view_cart")
 async def view_cart(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    if data.get("checkout_msg_id") == callback.message.message_id or (
+        callback.message.caption and "Ваш заказ" in callback.message.caption
+    ):
+        await callback.answer()
+        await edit_cart_callback(callback, state, bot)
+        return
+
     await callback.answer()
     cart_items = await rq.get_cart(callback.from_user.id)
 
-    # 🔥 ВСЕГДА УДАЛЯЕМ СТАРЫЕ МЕДИА И ТЕКУЩЕЕ СООБЩЕНИЕ ПРИ ОТКРЫТИИ КОРЗИНЫ
+    # 🔥 ВСЕГДА СНАЧАЛА УДАЛЯЕМ СТАРУЮ КОРЗИНУ ПРИ ВХОДЕ (ИЛИ ПРИ УДАЛЕНИИ ТОВАРА)
     await clear_media(callback.message.chat.id, state, bot)
     try:
         await callback.message.delete()
@@ -1074,7 +1155,6 @@ async def view_cart(callback: CallbackQuery, state: FSMContext, bot: Bot):
         if product.id not in seen_products:
             seen_products.add(product.id)
             if len(cart_media_fast) < 7:
-                # Игнорируем сохраненные заглушки
                 fid = None
                 if hasattr(product, "file_id") and product.file_id:
                     fid_list = [
@@ -1100,7 +1180,6 @@ async def view_cart(callback: CallbackQuery, state: FSMContext, bot: Bot):
                 else:
                     url_src = f"https://basarab.ru/15/image_proxy.php?url={raw_p}"
 
-                # Сохраняем оригинальные урлы для фоллбэка
                 cart_media_urls.append(url_src)
                 cart_media_fast.append(fid if fid else url_src)
 
@@ -1111,29 +1190,20 @@ async def view_cart(callback: CallbackQuery, state: FSMContext, bot: Bot):
         cart_media_urls = [DEFAULT_PHOTO]
 
     async def _send_cart(sources):
-        # Убираем дубликаты
-        unique_sources = []
-        seen_strings = set()
-        for m in sources:
-            if isinstance(m, str):
-                if m in seen_strings:
-                    continue
-                seen_strings.add(m)
-            unique_sources.append(m)
-
-        inputs = [InputMediaPhoto(media=m) for m in unique_sources]
-        is_album_local = len(unique_sources) > 1
+        # 🔥 КАЖДОМУ ТОВАРУ - СВОЯ КАРТИНКА ИЛИ ЗАГЛУШКА В АЛЬБОМЕ
+        inputs = [InputMediaPhoto(media=m) for m in sources]
+        is_album_local = len(inputs) > 1
 
         if is_album_local:
-            msgs = await callback.message.answer_media_group(media=inputs)
+            msgs = list(await callback.message.answer_media_group(media=inputs))
             msg = await callback.message.answer(
                 text=text, reply_markup=kb.cart_keyboard(cart_items)
             )
-            # 🔥 ОБЯЗАТЕЛЬНО сохраняем и фото, И ТЕКСТОВОЕ СООБЩЕНИЕ, чтобы потом удалить всё
             media_ids = [m.message_id for m in msgs] + [msg.message_id]
             await state.update_data(cart_media_ids=media_ids)
         else:
             media_item = inputs[0].media
+            # Т.к. мы уже удалили старое сообщение, мы просто присылаем новое (без попыток edit_media)
             msg = await callback.message.answer_photo(
                 photo=media_item,
                 caption=text,
@@ -1142,24 +1212,45 @@ async def view_cart(callback: CallbackQuery, state: FSMContext, bot: Bot):
             await state.update_data(cart_media_ids=[msg.message_id])
 
     try:
-        # 🚀 Пробуем отправить быстрым путем
-        await _send_cart(cart_media_fast)
+        try:
+            await _send_cart(cart_media_fast)
+        except TelegramRetryAfter as e:
+            return await callback.answer(
+                f"⏳ Слишком частое переключение! Подождите {e.retry_after} сек.",
+                show_alert=True,
+            )
     except TelegramBadRequest as e:
-        logger.warning(
-            f"Быстрая загрузка корзины не удалась. Скачиваем проблемные фото: {e}"
+        err_msg = (
+            str(e).split('error message "')[-1].replace('"', "")
+            if 'error message "' in str(e)
+            else str(e)
         )
-        # 🐌 Медленный путь
+        logger.warning(
+            f"Быстрая загрузка корзины не удалась ({err_msg}). Скачиваем вручную..."
+        )
+
         manual_media = await get_product_media_from_urls_fallback(cart_media_urls)
         try:
-            await _send_cart(manual_media)
-        except Exception as e2:
-            logger.error(f"Медленный путь тоже упал: {e2}")
-            msg = await callback.message.answer_photo(
-                photo=DEFAULT_PHOTO,
-                caption=text,
-                reply_markup=kb.cart_keyboard(cart_items),
-            )
-            await state.update_data(cart_media_ids=[msg.message_id])
+            try:
+                await _send_cart(manual_media)
+            except TelegramRetryAfter as e:
+                return await callback.answer(
+                    f"⏳ Слишком частое переключение! Подождите {e.retry_after} сек.",
+                    show_alert=True,
+                )
+        except Exception:
+            try:
+                msg = await callback.message.answer_photo(
+                    photo=DEFAULT_PHOTO,
+                    caption=text,
+                    reply_markup=kb.cart_keyboard(cart_items),
+                )
+                await state.update_data(cart_media_ids=[msg.message_id])
+            except TelegramRetryAfter as e:
+                return await callback.answer(
+                    f"⏳ Слишком частое переключение! Подождите {e.retry_after} сек.",
+                    show_alert=True,
+                )
 
 
 @user_router.callback_query(F.data == "return_from_cart")
@@ -1329,7 +1420,6 @@ async def increase_item_qty(
     await rq.change_cart_item_qty(cart_id, 1)
     await callback.answer("✅ Добавлено!")
 
-    # Если мы просто увеличиваем, картинки не меняются, поэтому быстро обновляем текст
     await edit_cart_callback(callback, state, bot)
 
 
@@ -1350,12 +1440,10 @@ async def decrease_item_qty(
     if current_qty > 1:
         await rq.change_cart_item_qty(cart_id, -1)
         await callback.answer("➖ Убавлено")
-        # Если количество больше 1, картинка не пропадает, просто обновляем текст
         await edit_cart_callback(callback, state, bot)
     else:
         await rq.remove_from_cart(cart_id)
         await callback.answer("❌ Удалено из корзины")
-        # 🔥 Товар удаляется полностью -> нужна полная перерисовка корзины (чтобы удалить картинку)
         await view_cart(callback, state, bot)
 
 
@@ -1365,7 +1453,6 @@ async def remove_item_from_cart(
 ):
     await rq.remove_from_cart(int(callback_data.item_id))
     await callback.answer("❌ Удалено из корзины")
-    # 🔥 Товар удаляется полностью -> нужна полная перерисовка корзины (чтобы удалить картинку)
     await view_cart(callback, state, bot)
 
 
@@ -1603,8 +1690,7 @@ async def process_checkout(callback: CallbackQuery, state: FSMContext, bot: Bot)
             )
 
             await callback.answer("Не хватает товаров на складе!", show_alert=True)
-            # Возвращаем корзину с ошибкой
-            await view_cart(callback, state, bot)
+            await edit_cart_callback(callback, state, bot)
             try:
                 await callback.message.answer(error_text)
             except Exception:
